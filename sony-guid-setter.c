@@ -126,6 +126,82 @@ static enum test_type {
 } test_mode;
 static uint16_t VID, PID;
 
+static int auto_select_sony(uint16_t *out_vid, uint16_t *out_pid)
+{
+	libusb_device **device_list = NULL;
+	ssize_t device_count = 0;
+	ssize_t idx = 0;
+	int r;
+	int found = 0;
+	unsigned char strbuf[256];
+
+	device_count = libusb_get_device_list(NULL, &device_list);
+	if (device_count < 0) {
+		perr("libusb_get_device_list failed: %s\n", libusb_strerror((enum libusb_error)device_count));
+		return -1;
+	}
+
+	for (idx = 0; idx < device_count; idx++) {
+		libusb_device *dev = device_list[idx];
+		struct libusb_device_descriptor desc;
+		libusb_device_handle *handle = NULL;
+		int got_strings = 0;
+		char manufacturer[256] = {0};
+		char product[256] = {0};
+
+		r = libusb_get_device_descriptor(dev, &desc);
+		if (r != LIBUSB_SUCCESS)
+			continue;
+
+		// Optional fast-path: Sony vendor ID
+		if (desc.idVendor == 0x054c) {
+			*out_vid = desc.idVendor;
+			*out_pid = desc.idProduct;
+			found = 1;
+			printf("Auto-detected Sony by VID: %04x:%04x\n", desc.idVendor, desc.idProduct);
+			break;
+		}
+
+		// Try to read strings and match prefix "Sony"
+		if (libusb_open(dev, &handle) == LIBUSB_SUCCESS && handle != NULL) {
+			if (desc.iManufacturer) {
+				int len = libusb_get_string_descriptor_ascii(handle, desc.iManufacturer, strbuf, sizeof(strbuf));
+				if (len > 0) {
+					if (len >= (int)sizeof(manufacturer)) len = (int)sizeof(manufacturer) - 1;
+					memcpy(manufacturer, strbuf, (size_t)len);
+					manufacturer[len] = '\0';
+					got_strings = 1;
+				}
+			}
+			if (desc.iProduct) {
+				int len = libusb_get_string_descriptor_ascii(handle, desc.iProduct, strbuf, sizeof(strbuf));
+				if (len > 0) {
+					if (len >= (int)sizeof(product)) len = (int)sizeof(product) - 1;
+					memcpy(product, strbuf, (size_t)len);
+					product[len] = '\0';
+					got_strings = 1;
+				}
+			}
+			libusb_close(handle);
+		}
+
+		if (got_strings) {
+			if ((manufacturer[0] && strncmp(manufacturer, "Sony", 4) == 0) ||
+			    (product[0] && strncmp(product, "Sony", 4) == 0)) {
+				*out_vid = desc.idVendor;
+				*out_pid = desc.idProduct;
+				found = 1;
+				printf("Auto-detected Sony by strings: %s %s (%04x:%04x)\n",
+					manufacturer, product, desc.idVendor, desc.idProduct);
+				break;
+			}
+		}
+	}
+
+	libusb_free_device_list(device_list, 1);
+	return found ? 0 : -1;
+}
+
 static int send_mass_storage_command(libusb_device_handle *handle, uint8_t endpoint, uint8_t lun,
 	uint8_t *cdb, uint8_t direction, int data_length, uint32_t *ret_tag)
 {
@@ -431,6 +507,7 @@ int main(int argc, char** argv)
 {
 	bool show_help = false;
 	bool debug_mode = false;
+	bool auto_mode = false;
 	const struct libusb_version* version;
 	int j, r;
 	size_t i, arglen;
@@ -468,6 +545,9 @@ int main(int argc, char** argv)
 				case 'g':
 					test_mode = USE_SONY_GUID_SETTER;
 					break;
+				case 'a':
+					auto_mode = true;
+					break;
 				default:
 					show_help = true;
 					break;
@@ -492,10 +572,11 @@ int main(int argc, char** argv)
 	}
 
 	if ((show_help) || (argc == 1) || (argc > 7)) {
-		printf("usage: %s [-h] [-d] [-i] [-k] [-b file] [-l lang] [-j] [-x] [-s] [-p] [-w] [vid:pid]\n", argv[0]);
+		printf("usage: %s [-h] [-d] [-g] [-a] [-l lang] [vid:pid]\n", argv[0]);
 		printf("   -h      : display usage\n");
 		printf("   -d      : enable debug output\n");
 		printf("   -g      : Sony Set GUID\n");
+		printf("   -a      : auto-detect Sony device VID:PID\n");
 		printf("   -l lang : language to report errors in (ISO 639-1)\n");
 		return 0;
 	}
@@ -521,6 +602,19 @@ int main(int argc, char** argv)
 		r = libusb_setlocale(error_lang);
 		if (r < 0)
 			printf("Invalid or unsupported locale '%s': %s\n", error_lang, libusb_strerror((enum libusb_error)r));
+	}
+
+	if (auto_mode) {
+		uint16_t detected_vid = 0, detected_pid = 0;
+		if (auto_select_sony(&detected_vid, &detected_pid) == 0) {
+			VID = detected_vid;
+			PID = detected_pid;
+			printf("Using auto-detected device: %04x:%04x\n", VID, PID);
+		} else {
+			printf("No Sony devices found.\n");
+			libusb_exit(NULL);
+			return 1;
+		}
 	}
 
 	test_device(VID, PID);
